@@ -98,13 +98,12 @@ int serveIndex(const std::string& socketPath,
   deferUnlink unlinkSocket(addr.sun_path);
 
   // Load index
-  // boost::filesystem::path indexDirectory(indexPath);
-  // auto consoleSink =
-  //     std::make_shared<spdlog::sinks::uncool_stderr_sink_mt>();
-  // consoleSink->set_color(spdlog::level::warn, consoleSink->magenta);
-  // auto consoleLog = spdlog::create("stderrLog", {consoleSink});
-  // salmonIndex = checkLoadIndex(indexDirectory, consoleLog);
-  std::cerr << "Faked built index" << std::endl;
+  boost::filesystem::path indexDirectory(indexPath);
+  auto consoleSink =
+      std::make_shared<spdlog::sinks::stderr_sink_mt>();
+  //  consoleSink->set_color(spdlog::level::warn, consoleSink->magenta);
+  auto consoleLog = spdlog::create("stderrLog", {consoleSink});
+  salmonIndex = checkLoadIndex(indexDirectory, consoleLog);
 
   // This only returns in a child process to continue execution of Salmon
   return serverMainLoop(argc, argv, unix_socket);
