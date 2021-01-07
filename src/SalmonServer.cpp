@@ -1,4 +1,6 @@
 #include "SalmonServer.hpp"
+#include <asm-generic/socket.h>
+#include <bits/types/struct_iovec.h>
 #include <boost/program_options/parsers.hpp>
 #include <cerrno>
 #include <csignal>
@@ -98,7 +100,7 @@ int serveIndex(const std::string& socketPath,
   // Load index
   // boost::filesystem::path indexDirectory(indexPath);
   // auto consoleSink =
-  //     std::make_shared<spdlog::sinks::ansicolor_stderr_sink_mt>();
+  //     std::make_shared<spdlog::sinks::uncool_stderr_sink_mt>();
   // consoleSink->set_color(spdlog::level::warn, consoleSink->magenta);
   // auto consoleLog = spdlog::create("stderrLog", {consoleSink});
   // salmonIndex = checkLoadIndex(indexDirectory, consoleLog);
@@ -111,16 +113,31 @@ int serveIndex(const std::string& socketPath,
 static volatile bool done = false;
 void term_handler(int) { done = true; }
 void chld_handler(int) { /* Do nothing */ }
-void setupSignals() {
-  struct sigaction act;
-  memset(&act, '\0', sizeof(act));
-  act.sa_handler = term_handler;
-  if(sigaction(SIGINT, &act, nullptr) == -1 || sigaction(SIGTERM, &act, nullptr) == -1)
-    cpperror("Error redirecting termination signals");
-  act.sa_handler = chld_handler;
-  if(sigaction(SIGCHLD, &act, nullptr) == -1)
-    cpperror("Error redirecting SIGCHLD");
-}
+
+struct DefineSignals {
+  struct sigaction actionInt, actionTerm, actionChld, actionPipe;
+
+  void setup() {
+    struct sigaction act;
+    memset(&act, '\0', sizeof(act));
+    act.sa_handler = term_handler;
+    if (sigaction(SIGINT, &act, &actionInt) == -1 ||
+        sigaction(SIGTERM, &act, &actionTerm) == -1)
+      cpperror("Error redirecting termination signals");
+    act.sa_handler = chld_handler;
+    if (sigaction(SIGCHLD, &act, &actionChld) == -1)
+      cpperror("Error ignoring SIGCHLD");
+    if(sigaction(SIGPIPE, &act, &actionPipe) == -1)
+      cpperror("Error ignore SIGPIPE");
+  }
+
+  void reset() {
+    sigaction(SIGINT, &actionInt, nullptr);
+    sigaction(SIGTERM, &actionTerm, nullptr);
+    sigaction(SIGCHLD, &actionChld, nullptr);
+    sigaction(SIGPIPE, &actionPipe, nullptr);
+  }
+};
 
 // When a child is done (process waited for), send it it's status and close
 // socket
@@ -160,7 +177,8 @@ void handleDoneChildren(std::map<pid_t,int>& childrenSocket) {
 
 int handleChild(int fd, int& argc, argvtype& argv);
 int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
-  setupSignals();
+  DefineSignals signals;
+  signals.setup();
 
   if(listen(unix_socket, 5) == -1)
     cpperror("Error listening on unix socket");
@@ -210,6 +228,7 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
 
       case 0:
         deferUnlink::parent = false;
+        signals.reset();
         return handleChild(fd, argc, argv);
         break;
 
@@ -233,37 +252,64 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
   return 0;
 }
 
-void resetSignal() {
-  struct sigaction act;
-  memset(&act, '\0', sizeof(act));
-  act.sa_handler = SIG_DFL;
-  sigaction(SIGINT, &act, nullptr);
-  sigaction(SIGTERM, &act, nullptr);
-}
-
 // In child, redirect outputs, update argc and argv, then continue processing.
 // In case of error, exit(1). Parent will send error to client.
+constexpr int numFds = 4;
 static constexpr size_t size = 1024 * 1024; // Maximum argv size
 static std::vector<char> rawArgv;
 static std::vector<const char*> childArgv;
 int handleChild(int fd, int& argc, argvtype& argv) {
-  resetSignal();
-  // XXX TBD receive and redirect stdout / stderr
   size_t offset = 0;
 
-  size_t argvLen;
+  int              fds[numFds];
+  size_t           argvLen;
+  struct iovec io           = {
+    .iov_base               = &argvLen,
+    .iov_len                = sizeof(argvLen)
+  };
+  union {
+    char           buf[CMSG_SPACE(sizeof(fds))];
+    struct cmsghdr align;
+  } u;
+  struct msghdr msg = { 0 };
+  msg.msg_iov = &io;
+  msg.msg_iovlen = 1;
+  msg.msg_control = u.buf;
+  msg.msg_controllen = sizeof(u.buf);
   while(true) {
-    ssize_t received = recv(fd, &argvLen, sizeof(argvLen), 0);
+    ssize_t        received = recvmsg(fd, &msg, 0);
     if(received == -1) {
       if(errno == EINTR)
         continue;
       cpperror("Failed to receive client argument length");
     }
+    if(received == 0)
+      throw std::runtime_error("Premature closure of client socket");
     break;
   }
   if(argvLen >= size)
     throw std::runtime_error("Client argument length too long");
+  struct cmsghdr* cmsg;
+  for(cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+    if(cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+      memcpy(&fds, CMSG_DATA(cmsg), sizeof(fds));
+      break;
+    }
+  }
+  if(cmsg == nullptr)
+    cpperror("Failed to receive client file descriptors");
 
+  // Redirect the file descriptors
+  if(fchdir(fds[3]))
+    cpperror("Failed to change current working directories");
+  close(fds[3]);
+  for(int i = 0; i < 3; ++i) {
+    if(dup2(fds[i], i) == -1)
+      cpperror("Failed to redirect input/output");
+    close(fds[i]);
+  }
+
+  // Receive arguments
   rawArgv.resize(argvLen + 2, '\0'); // +1 to make sure that there is 2 '\0' at the end
   while(offset < argvLen) {
     ssize_t received = recv(fd, rawArgv.data() + offset, argvLen - offset, 0);
@@ -272,9 +318,8 @@ int handleChild(int fd, int& argc, argvtype& argv) {
         continue;
       cpperror("Warning: failed to received argument from client");
     }
-    if(received == 0) {
-      return EXIT_FAILURE;
-    }
+    if(received == 0)
+      throw std::runtime_error("Premature closure of client socket");
     offset += received;
   }
 
@@ -287,6 +332,74 @@ int handleChild(int fd, int& argc, argvtype& argv) {
   argv = childArgv.data();
 
   return -1;
+}
+
+// Send command line arguments and stdint, stdout, stderr and current directory
+void sendArguments(int unixSocket, const std::vector<std::string>& opts) {
+  // Data for file descriptors
+  int fdDir = open(".", O_RDONLY);
+  if (fdDir == -1)
+    cpperror("Failed top open current directory");
+  int fds[numFds];
+  fds[0] = STDIN_FILENO;
+  fds[1] = STDOUT_FILENO;
+  fds[2] = STDERR_FILENO;
+  fds[3] = fdDir;
+
+  // Linear copies of the arguments
+  size_t argvLen = 0;
+  for (const auto& opt : opts)
+    argvLen += opt.size() + 1;
+
+  std::vector<char> rawArgv(argvLen, '\0');
+  char* cur = rawArgv.data();
+  for (const auto& opt : opts) {
+    strcpy(cur, opt.c_str());
+    cur += opt.size() + 1;
+  }
+
+  // Collect argvLen and fds (as auxiliary) in a msg for sendmsg
+  struct iovec io       = {
+    .iov_base           = &argvLen,
+    .iov_len            = sizeof(argvLen)
+  };
+  union {
+    char           buf[CMSG_SPACE(sizeof(fds))];
+    struct cmsghdr align;
+  } u;
+  struct msghdr    msg  = {0};
+  msg.msg_iov           = &io;
+  msg.msg_iovlen        = 1;
+  msg.msg_control       = u.buf;
+  msg.msg_controllen    = sizeof(u.buf);
+  struct cmsghdr*  cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level      = SOL_SOCKET;
+  cmsg->cmsg_type       = SCM_RIGHTS;
+  cmsg->cmsg_len        = CMSG_LEN(sizeof(fds));
+  memcpy(CMSG_DATA(cmsg), fds, sizeof(fds));
+
+  while (true) {
+    ssize_t sent = sendmsg(unixSocket, &msg, 0);
+    if (sent == -1) {
+      if (errno == EINTR)
+        continue;
+      cpperror("Failed to send client argument length");
+    }
+    break;
+  }
+
+  // Now send the content of rawArgv
+  size_t offset = 0;
+  while (offset < argvLen) {
+    ssize_t sent =
+        send(unixSocket, rawArgv.data() + offset, argvLen - offset, 0);
+    if (sent == -1) {
+      if (errno == EINTR)
+        continue;
+      cpperror("Failed to send arguments to server");
+    }
+    offset += sent;
+  }
 }
 
 int contactServer(const std::string& socketPath, const std::vector<std::string>& opts) {
@@ -303,37 +416,7 @@ int contactServer(const std::string& socketPath, const std::vector<std::string>&
   if(connect(unixSocket, (struct sockaddr*)&addr, sizeof(addr)) == -1)
     cpperror("Failed to connect to server");
 
-  // Send my arguments
-  size_t argvLen = 0;
-  for(const auto& opt : opts)
-    argvLen += opt.size() + 1;
-
-  std::vector<char>rawArgv(argvLen, '\0');
-  char* cur = rawArgv.data();
-  for(const auto& opt : opts) {
-    strcpy(cur, opt.c_str());
-    cur += opt.size() + 1;
-  }
-
-  while(true) {
-    ssize_t sent = send(unixSocket, &argvLen, sizeof(argvLen), 0);
-    if(sent == -1) {
-      if(errno == EINTR)
-        continue;
-      cpperror("Failed to send client argument length");
-    }
-    break;
-  }
-  size_t offset = 0;
-  while(offset < argvLen) {
-    ssize_t sent = send(unixSocket, rawArgv.data() + offset, argvLen - offset, 0);
-    if(sent == -1) {
-      if(errno == EINTR)
-        continue;
-      cpperror("Failed to send arguments to server");
-    }
-    offset += sent;
-  }
+  sendArguments(unixSocket, opts);
 
   // Wait for return status
   int status;
