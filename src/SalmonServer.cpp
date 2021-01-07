@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <map>
+#include <poll.h>
 
 #include <boost/program_options.hpp>
 #include <boost/program_options/options_description.hpp>
@@ -141,16 +142,18 @@ void handleDoneChildren(std::map<pid_t,int>& childrenSocket) {
       continue;
     }
 
-    while(true) {
-      auto sent = send(it->second, &status, sizeof(status), 0);
-      if(sent == -1) {
-        if(errno == EINTR)
-          continue;
-        std::cerr << "Warning: failed to send status to process " << pid << ' ' << strerror(errno) << std::endl;
+    if(it->second != -1) { // If -1, already closed by client, so can't send status
+      while(true) {
+        auto sent = send(it->second, &status, sizeof(status), 0);
+        if(sent == -1) {
+          if(errno == EINTR)
+            continue;
+          std::cerr << "Warning: failed to send status to process " << pid << ' ' << strerror(errno) << std::endl;
+        }
+        break;
       }
-      break;
+      close(it->second);
     }
-    close(it->second);
     childrenSocket.erase(it);
   }
 }
@@ -163,34 +166,65 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
     cpperror("Error listening on unix socket");
 
   std::map<pid_t,int> childrenSocket;
+  std::vector<struct pollfd> pollfds;
+  std::vector<pid_t> pollpids;
 
   while(!done) {
     handleDoneChildren(childrenSocket);
 
-    struct sockaddr_un addr;
-    socklen_t          addrlen;
-    int                fd = accept(unix_socket, (struct sockaddr*)&addr, &addrlen);
-    if(fd == -1) {
-      if(errno == EINTR)
-        continue;
-      cpperror("Error accepting on unix socket");
+    pollfds.resize(childrenSocket.size() + 1);
+    pollpids.resize(childrenSocket.size() + 1);
+    pollfds[0].fd = unix_socket;
+    pollfds[0].events = POLLIN;
+    int i = 1;
+    for(const auto& child : childrenSocket) {
+      pollfds[i].fd = child.second;
+      pollfds[i].events = POLLIN;
+      pollpids[i] = child.first;
+      ++i;
     }
 
-    pid_t pid = fork();
-    switch(pid) {
-    case -1:
-      std::cerr << "Warning: failed to create child process: " << strerror(errno) << std::endl;
-      close(fd); // Summary termination error sent to client
-      break;
+    int res = poll(pollfds.data(), pollfds.size(), -1);
+    if(res == -1) {
+      if(errno == EINTR)
+        continue;
+      cpperror("Error polling file descriptors");
+    }
 
-    case 0:
-      deferUnlink::parent = false;
-      return handleChild(fd, argc, argv);
-      break;
+    if(pollfds[0].revents | POLLIN) {
+      struct sockaddr_un addr;
+      socklen_t          addrlen;
+      int                fd = accept(unix_socket, (struct sockaddr*)&addr, &addrlen);
+      if(fd == -1) {
+        if(errno == EINTR)
+          continue;
+        cpperror("Error accepting on unix socket");
+      }
 
-    default:
-      childrenSocket[pid] = fd;
-      break;
+      pid_t pid = fork();
+      switch(pid) {
+      case -1:
+        std::cerr << "Warning: failed to create child process: " << strerror(errno) << std::endl;
+        close(fd); // Summary termination error sent to client
+        break;
+
+      case 0:
+        deferUnlink::parent = false;
+        return handleChild(fd, argc, argv);
+        break;
+
+      default:
+        childrenSocket[pid] = fd;
+        break;
+      }
+    }
+
+    for(size_t i = 1; i < pollfds.size(); ++i) {
+      if(pollfds[i].revents | POLLHUP) { // Client closed it's socket. Forget about it
+        close(pollfds[i].fd);
+        kill(pollpids[i], SIGTERM);
+        childrenSocket[pollpids[i]] = -1;
+      }
     }
   }
 
