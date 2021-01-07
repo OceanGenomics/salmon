@@ -2399,7 +2399,9 @@ int salmonQuantify(int argc, const char* argv[]) {
 
   // If passed --server: Read index and wait for requests if passed --index,-i,
   // or contact a server if --index,-i is missing. Otherwise, do nothing
-  salmonServer(argc, argv, salmonIndex);
+  int serverDone = salmonServer(argc, argv, salmonIndex);
+  if(serverDone != -1)
+    return serverDone;
 
   SalmonOpts sopt;
 

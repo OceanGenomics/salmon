@@ -20,7 +20,10 @@ typedef const char** argvtype;
 // (minus --server), and then wait until the socket is closed and exits. The
 // client function never returns as the processing is done by a process forked
 // by the server.
-void salmonServer(int& argc, argvtype& argv,
-                  std::unique_ptr<SalmonIndex>& salmonIndex);
+//
+// Returns -1 if work should continue normally (either no server, or inside a
+// child process). Otherwise, it returns an error status.
+int salmonServer(int& argc, argvtype& argv,
+                 std::unique_ptr<SalmonIndex>& salmonIndex);
 
 #endif // __SALMON_SERVER_HPP__
