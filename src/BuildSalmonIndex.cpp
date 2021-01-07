@@ -256,3 +256,25 @@ Creates a salmon index.
   }
   return ret;
 }
+
+std::unique_ptr<SalmonIndex> checkLoadIndex(const boost::filesystem::path& indexDirectory, std::shared_ptr<spdlog::logger>& logger) {
+  // ==== Figure out the index type
+  boost::filesystem::path versionPath =
+    indexDirectory / "versionInfo.json";
+  SalmonIndexVersionInfo versionInfo;
+  versionInfo.load(versionPath);
+  if (versionInfo.indexVersion() == 0) {
+    fmt::MemoryWriter infostr;
+    infostr
+      << "Error: The index version file " << versionPath.string()
+      << " doesn't seem to exist.  Please try re-building the salmon "
+      "index.";
+    throw std::invalid_argument(infostr.str());
+  }
+  // Check index version compatibility here
+  auto indexType = versionInfo.indexType();
+  // ==== Figure out the index type
+  std::unique_ptr<SalmonIndex> res(new SalmonIndex(logger, indexType));
+  res->load(indexDirectory);
+  return res;
+}

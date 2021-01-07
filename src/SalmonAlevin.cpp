@@ -2603,7 +2603,7 @@ int alevin_sc_align(AlevinOpts<ProtocolT>& aopt,
     // ==== END: Library format processing ===
 
     if(!salmonIndex)
-      salmonIndex = ReadExperimentT::checkLoadIndex(indexDirectory, sopt.jointLog);
+      salmonIndex = checkLoadIndex(indexDirectory, sopt.jointLog);
     auto idxType = salmonIndex->indexType();
 
     MappingStatistics mstats;
@@ -2714,7 +2714,7 @@ int alevinQuant(AlevinOpts<ProtocolT>& aopt,
     }
     // ==== END: Library format processing ===
     if(!salmonIndex)
-      salmonIndex = ReadExperimentT::checkLoadIndex(indexDirectory, sopt.jointLog);
+      salmonIndex = checkLoadIndex(indexDirectory, sopt.jointLog);
     auto idxType = salmonIndex->indexType();
 
     MappingStatistics mstats;

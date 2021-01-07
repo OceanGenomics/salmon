@@ -94,6 +94,7 @@
 #include "SalmonUtils.hpp"
 #include "Transcript.hpp"
 #include "SalmonMappingUtils.hpp"
+#include "SalmonServer.hpp"
 
 #include "AlignmentGroup.hpp"
 #include "BiasParams.hpp"
@@ -2396,6 +2397,10 @@ int salmonQuantify(int argc, const char* argv[]) {
   int32_t numBiasSamples{0};
   std::unique_ptr<SalmonIndex> salmonIndex; // For early loading
 
+  // If passed --server: Read index and wait for requests if passed --index,-i,
+  // or contact a server if --index,-i is missing. Otherwise, do nothing
+  salmonServer(argc, argv, salmonIndex);
+
   SalmonOpts sopt;
 
   sopt.numThreads = std::thread::hardware_concurrency();
@@ -2492,7 +2497,7 @@ transcript abundance from RNA-seq reads
     // ==== END: Library format processing ===
 
     if(!salmonIndex) {
-      salmonIndex = ReadExperimentT::checkLoadIndex(indexDirectory, sopt.jointLog);
+      salmonIndex = checkLoadIndex(indexDirectory, sopt.jointLog);
     }
 
     MappingStatistics mstats;
