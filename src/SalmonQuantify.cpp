@@ -27,6 +27,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <random>
@@ -2393,6 +2394,7 @@ int salmonQuantify(int argc, const char* argv[]) {
   namespace po = boost::program_options;
 
   int32_t numBiasSamples{0};
+  std::unique_ptr<SalmonIndex> salmonIndex; // For early loading
 
   SalmonOpts sopt;
 
@@ -2489,13 +2491,12 @@ transcript abundance from RNA-seq reads
     }
     // ==== END: Library format processing ===
 
-    SalmonIndexVersionInfo versionInfo;
-    boost::filesystem::path versionPath = indexDirectory / "versionInfo.json";
-    versionInfo.load(versionPath);
-    auto idxType = versionInfo.indexType();
+    if(!salmonIndex) {
+      salmonIndex = ReadExperimentT::checkLoadIndex(indexDirectory, sopt.jointLog);
+    }
 
     MappingStatistics mstats;
-    ReadExperimentT experiment(readLibraries, indexDirectory, sopt);
+    ReadExperimentT experiment(readLibraries, salmonIndex.get(), sopt);
 
     // This will be the class in charge of maintaining our
     // rich equivalence classes
