@@ -389,6 +389,21 @@ int handleChild(int fd, int& argc, argvtype& argv) {
 // of quantification by reading the UNIX socket.
 //
 
+int sendBuffer(int socket, const char* buf, size_t size) {
+  size_t offset = 0;
+  while (offset < size) {
+    ssize_t sent =
+        send(socket, buf + offset, size - offset, 0);
+    if (sent == -1) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    offset += sent;
+  }
+  return size;
+}
+
 // Send command line arguments and stdint, stdout, stderr and current directory
 void sendArguments(int unixSocket, const std::vector<std::string>& opts) {
   // Data for file descriptors
@@ -445,17 +460,8 @@ void sendArguments(int unixSocket, const std::vector<std::string>& opts) {
   }
 
   // Now send the content of rawArgv
-  size_t offset = 0;
-  while (offset < argvLen) {
-    ssize_t sent =
-        send(unixSocket, rawArgv.data() + offset, rawArgv.size() - offset, 0);
-    if (sent == -1) {
-      if (errno == EINTR)
-        continue;
-      cpperror("Failed to send arguments to server");
-    }
-    offset += sent;
-  }
+  if(sendBuffer(unixSocket, rawArgv.data(), rawArgv.size()) == -1)
+    cpperror("Failed to send arguments");
 }
 
 int contactServer(const std::string& socketPath, const std::vector<std::string>& opts) {
