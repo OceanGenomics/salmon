@@ -6,15 +6,18 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <map>
+#include <poll.h>
 #include <signal.h>
+#include <stack>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <sys/types.h> /* See NOTES */
+#include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <map>
-#include <poll.h>
 
 #include <boost/program_options.hpp>
 #include <boost/program_options/options_description.hpp>
@@ -64,12 +67,66 @@ void cpperror(const char* msg) {
   throw std::runtime_error(std::string(msg) + ": " + strerror(errno));
 }
 
+// utility functions
+//
+
+template<typename C>
+size_t dataSize(const C& container) { return container.size() * sizeof(typename C::value_type); }
+
+// Send full buffer to fd, restarting after interruptions or partial send
+ssize_t sendBuffer(int fd, const char* buf, size_t size) {
+  size_t offset = 0;
+  while (offset < size) {
+    ssize_t sent = send(fd, buf + offset, size - offset, 0);
+    if (sent == -1) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    offset += sent;
+  }
+  return offset;
+}
+// Same. Convenience function for std::vector<type> for any type
+template<typename C>
+ssize_t sendBuffer(int fd, const C& container) {
+  return sendBuffer(fd, (const char*)container.data(), dataSize(container));
+}
+
+// Receive exactly size bytes from fd, restarting after interruptions and
+// partial receive
+ssize_t receiveBuffer(int fd, char* buffer, size_t size) {
+  size_t offset = 0;
+  while (offset < size) {
+    ssize_t received = recv(fd, buffer + offset, size - offset, 0);
+    if (received == -1) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    if (received == 0)
+      return 0;
+    offset += received;
+  }
+  return offset;
+}
+template<typename C>
+ssize_t receiveBuffer(int fd, C& container) {
+  return receiveBuffer(fd, (char*)container.data(), dataSize(container));
+}
+
+// Defer utility objects
 struct deferClose {
   int fd_;
   deferClose(int fd) : fd_(fd) {}
   ~deferClose() { close(fd_); }
 };
-// Cleanup, but only if we are the parent process
+struct deferCloseDir {
+  DIR* d;
+  deferCloseDir(DIR* dir) : d(dir) {}
+  ~deferCloseDir() { closedir(d); }
+};
+// Unlink file, but only if we are the parent process
 struct deferUnlink {
   static bool parent;
   const char* path_;
@@ -230,10 +287,6 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
     }
 
     if(pollfds[0].revents & POLLIN) {
-      // struct sockaddr_un addr;
-      // socklen_t          addrlen;
-      // std::cerr << "Unix socket pollin " << unix_socket << ' ' << pollfds[0].fd << std::endl;
-      // system("ls -l /proc/self/fd");
       int fd = accept(pollfds[0].fd, nullptr, nullptr);
       if(fd == -1) {
         if(errno == EINTR)
@@ -279,37 +332,87 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
 
 //
 // Server side, Child process.
-// 
+//
 // Receive arguments and file descriptor.
 // After resetting the environment, return with -1 to keep on processing
 // with the quantification
 ///
 
-constexpr int numFds = 4;
-static constexpr size_t size = 1024 * 1024; // Maximum argv size
+// dup file descriptor from[i] to to[i] and close from[i] so as to reproduce the
+// fd environment of the client. The difficulty is that dup may enter in
+// collision (close) with another from[j]. First we detect chain of collisions
+// to do the dups in the right order. In case of a collision cycle, break the
+// cycle by duping a fd from the cycle to a very high number first.
+void dupClose(int from, int to) {
+  if(dup2(from, to) == -1)
+    cpperror("Dup file descriptors");
+  close(from);
+}
+void redirectFds(const std::vector<int>& from, const std::vector<int>& to) {
+  std::map<int, int> fromTo;
+  int max = 0;
+  for(size_t i = 0; i < from.size(); ++i) {
+    max = std::max(max, from[i]);
+    max = std::max(max, to[i]);
+    fromTo[from[i]] = to[i];
+  }
+
+  std::stack<std::pair<int, int>> stack;
+  while(!fromTo.empty()) {
+    // Find the dependency chain
+    stack.push(*fromTo.begin());
+    int start = stack.top().first;
+    bool cycle = false;
+    while(true) {
+      auto it = fromTo.find(stack.top().second);
+      if(it == fromTo.end())
+        break; // End of dependency chain
+      if(it->second == start) { // Found a cycle. Break it
+        dupClose(it->first, max + 1);
+        cycle = true;
+        fromTo.erase(it);
+        break;
+      }
+      stack.push(*it);
+    }
+
+    // Unwind stack / dependency chain
+    while(!stack.empty()) {
+      dupClose(stack.top().first, stack.top().second);
+      fromTo.erase(stack.top().first);
+      stack.pop();
+    }
+
+    // Last one, the cycle breaker if any. It was moved to max+1 and is supposed
+    // to go to start.first.
+    if(cycle)
+      dupClose(max + 1, start);
+  }
+}
+
+constexpr size_t maxFds = 100; // Maximum number of file descriptors to send
+static constexpr size_t maxArgvLen = 1024 * 1024; // Maximum argv size
 static std::vector<char> rawArgv;
 static std::vector<const char*> childArgv;
-int handleChild(int fd, int& argc, argvtype& argv) {
+int handleChild(int socket, int& argc, argvtype& argv) {
   size_t offset = 0;
 
-  int              fds[numFds];
-  size_t           argvLen;
+  size_t lens[2];
   struct iovec io           = {
-    .iov_base               = &argvLen,
-    .iov_len                = sizeof(argvLen)
+    .iov_base               = lens,
+    .iov_len                = sizeof(lens)
   };
-  union {
-    char           buf[CMSG_SPACE(sizeof(fds))];
-    struct cmsghdr align;
-  } u;
+  std::vector<int> fds;
+  std::vector<char> msgbuf(
+      CMSG_SPACE(maxFds * sizeof(decltype(fds)::value_type)));
   struct msghdr msg;
   memset(&msg, '\0', sizeof(msg));
   msg.msg_iov = &io;
   msg.msg_iovlen = 1;
-  msg.msg_control = u.buf;
-  msg.msg_controllen = sizeof(u.buf);
+  msg.msg_control = msgbuf.data();
+  msg.msg_controllen = msgbuf.size();
   while(true) {
-    ssize_t        received = recvmsg(fd, &msg, 0);
+    ssize_t received = recvmsg(socket, &msg, 0);
     if(received == -1) {
       if(errno == EINTR)
         continue;
@@ -319,27 +422,41 @@ int handleChild(int fd, int& argc, argvtype& argv) {
       throw std::runtime_error("Premature closure of client socket");
     break;
   }
-  if(argvLen >= size)
+  const size_t fdNum = lens[0];
+  const size_t argvLen = lens[1];
+  if(fdNum > maxFds)
+    throw std::runtime_error("Client sent too many file descriptors");
+  if(fdNum == 0)
+    throw std::runtime_error("Client sent no file descriptors"); // Should always have at least current directory
+  if(argvLen >= maxArgvLen)
     throw std::runtime_error("Client argument length too long");
-  struct cmsghdr* cmsg;
-  for(cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+
+  // Get transferred file descriptors from ancillary data
+  for(auto cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
     if(cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-      memcpy(&fds, CMSG_DATA(cmsg), sizeof(fds));
+      fds.resize(fdNum);
+      memcpy(fds.data(), CMSG_DATA(cmsg), dataSize(fds));
       break;
     }
   }
-  if(cmsg == nullptr)
+  if(fds.empty())
     cpperror("Failed to receive client file descriptors");
 
-  // Redirect the file descriptors
-  if(fchdir(fds[3]))
-    cpperror("Failed to change current working directories");
-  close(fds[3]);
-  for(int i = 0; i < 3; ++i) {
-    if(dup2(fds[i], i) == -1)
-      cpperror("Failed to redirect input/output");
-    close(fds[i]);
+  // Get the original position of the file descriptors
+  std::vector<int> ofds(fdNum);
+  switch (receiveBuffer(socket, ofds)) {
+  case -1: cpperror("Failed to get the old file descriptor positions"); break;
+  case 0: cpperror("Premature closure from client"); break;
+  default: break;
   }
+
+  // Last file descriptor is current directory
+  if(fchdir(fds.back()))
+    cpperror("Failed to change current working directories");
+  close(fds.back());
+  fds.pop_back();
+  ofds.pop_back();
+  redirectFds(fds, ofds);
 
   // First copy the existing argv[0]. Then add a missing fake '-i /' (5 characters).
   // Then copy the arguments sent over by the client. Add 2 '\0' to make sure
@@ -357,17 +474,10 @@ int handleChild(int fd, int& argc, argvtype& argv) {
   ++cur;
   *cur++ = '/';
   ++cur;
-  while(offset < argvLen) {
-    ssize_t received = recv(fd, cur, argvLen - offset, 0);
-    if(received == -1) {
-      if(errno == EINTR)
-        continue;
-      cpperror("Warning: failed to received argument from client");
-    }
-    if(received == 0)
-      throw std::runtime_error("Premature closure of client socket");
-    offset += received;
-    cur += received;
+  switch (receiveBuffer(socket, cur, argvLen)) {
+  case -1: cpperror("Failed to received argument from client"); break;
+  case 0: throw std::runtime_error("Premature closure of client socket"); break;
+  default: break;
   }
 
   cur = rawArgv.data();
@@ -389,32 +499,38 @@ int handleChild(int fd, int& argc, argvtype& argv) {
 // of quantification by reading the UNIX socket.
 //
 
-int sendBuffer(int socket, const char* buf, size_t size) {
-  size_t offset = 0;
-  while (offset < size) {
-    ssize_t sent =
-        send(socket, buf + offset, size - offset, 0);
-    if (sent == -1) {
-      if (errno == EINTR)
-        continue;
-      return -1;
-    }
-    offset += sent;
+// Returns all the open file descriptor (except those in the exception list).
+std::vector<int> collectOpenFds(int exception) {
+  DIR* dir = opendir("/dev/fd");
+  if(!dir)
+    cpperror("Failed to open /dev/fd");
+  deferCloseDir closeDevFd(dir);
+
+  std::vector<int> res;
+
+  char* endptr;
+  for(auto entry = readdir(dir); entry; entry = readdir(dir)) {
+    if(entry->d_name[0] == '.') continue;
+    long fd = strtol(entry->d_name, &endptr, 10);
+    if(*endptr != '\0') continue; // Conversion error
+    if(exception == fd) continue;
+    if(dirfd(dir) == fd) continue;
+    res.push_back(fd);
   }
-  return size;
+  return res;
 }
 
 // Send command line arguments and stdint, stdout, stderr and current directory
 void sendArguments(int unixSocket, const std::vector<std::string>& opts) {
   // Data for file descriptors
+  auto fds = collectOpenFds(unixSocket);
+  if(fds.size() > maxFds)
+    cpperror("Too many file descriptors open");
   int fdDir = open(".", O_RDONLY);
   if (fdDir == -1)
     cpperror("Failed top open current directory");
-  int fds[numFds];
-  fds[0] = STDIN_FILENO;
-  fds[1] = STDOUT_FILENO;
-  fds[2] = STDERR_FILENO;
-  fds[3] = fdDir;
+  deferClose closeFdDir(fdDir);
+  fds.push_back(fdDir);
 
   // Linear copies of the arguments
   size_t argvLen = 0;
@@ -428,39 +544,41 @@ void sendArguments(int unixSocket, const std::vector<std::string>& opts) {
     cur += opt.size() + 1;
   }
 
-  // Collect argvLen and fds (as auxiliary) in a msg for sendmsg
+  // Collect number of fds, argvLen and fds (as auxiliary) in a msg for sendmsg
+
+  size_t lens[2] = { fds.size(), argvLen };
   struct iovec io       = {
-    .iov_base           = &argvLen,
-    .iov_len            = sizeof(argvLen)
+    .iov_base           = lens,
+    .iov_len            = sizeof(lens)
   };
-  union {
-    char           buf[CMSG_SPACE(sizeof(fds))];
-    struct cmsghdr align;
-  } u;
-  struct msghdr    msg;
+  std::vector<char> msgBuf(CMSG_SPACE(dataSize(fds)));
+  struct msghdr msg;
   memset(&msg, '\0', sizeof(msg));
   msg.msg_iov           = &io;
   msg.msg_iovlen        = 1;
-  msg.msg_control       = u.buf;
-  msg.msg_controllen    = sizeof(u.buf);
+  msg.msg_control       = msgBuf.data();
+  msg.msg_controllen    = msgBuf.size();
   struct cmsghdr*  cmsg = CMSG_FIRSTHDR(&msg);
   cmsg->cmsg_level      = SOL_SOCKET;
   cmsg->cmsg_type       = SCM_RIGHTS;
-  cmsg->cmsg_len        = CMSG_LEN(sizeof(fds));
-  memcpy(CMSG_DATA(cmsg), fds, sizeof(fds));
-
+  cmsg->cmsg_len        = CMSG_LEN(dataSize(fds));
+  memcpy(CMSG_DATA(cmsg), fds.data(), dataSize(fds));
   while (true) {
     ssize_t sent = sendmsg(unixSocket, &msg, 0);
     if (sent == -1) {
       if (errno == EINTR)
         continue;
-      cpperror("Failed to send client argument length");
+      cpperror("Failed to send sizes of file descriptors and arguments");
     }
     break;
   }
 
+  // Sends the original list of positions of the file descriptors
+  if (sendBuffer(unixSocket, fds) == -1)
+    cpperror("Failed to send list of file descriptors");
+
   // Now send the content of rawArgv
-  if(sendBuffer(unixSocket, rawArgv.data(), rawArgv.size()) == -1)
+  if (sendBuffer(unixSocket, rawArgv) == -1)
     cpperror("Failed to send arguments");
 }
 
