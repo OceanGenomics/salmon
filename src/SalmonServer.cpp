@@ -138,17 +138,32 @@ struct DefineSignals {
   }
 };
 
+//
+// Server side, parent process
+//
+// The server accepts connections on the UNIX socket. For each new connection,
+// it forks a new child process that will do the actual work. Keep track of the connection
+// "child pid" -> "socket fd". When a child dies, write the exit status on the socket fd
+// (for the client to report), then close the socket fd.
+//
+// If a socket fd hangs up (poll returns HUP), which means the client closed its side (e.g.,
+// the client got Ctrl-C and died), then we send SIGTERM to the corresponding child process
+// that is doing the work on behalf of this client.
+//
+
 // When a child is done (process waited for), send it it's status and close
 // socket
 void handleDoneChildren(std::map<pid_t,int>& childrenSocket) {
   while(true) {
     int status;
-    pid_t pid = wait(&status);
+    pid_t pid = waitpid(-1, &status, WNOHANG);
+    if(pid == 0)
+      break; // No child has stopped
     if(pid == -1) {
-      if(errno == ECHILD)
-        break; // No child waiting. Done
       if(errno == EINTR)
         continue;
+      if(errno == ECHILD)
+        break;
       std::cerr << "Warning: error while waiting for a child: " << strerror(errno) << std::endl;
       break;
     }
@@ -179,7 +194,7 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
   DefineSignals signals;
   signals.setup();
 
-  std::cerr << "Server waiting for requests" << std::endl;
+  std::cerr << "Server waiting for requests. Ctrl-C to stop." << std::endl;
   if(listen(unix_socket, 5) == -1)
     cpperror("Error listening on unix socket");
 
@@ -194,27 +209,32 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
     pollpids.resize(childrenSocket.size() + 1);
     pollfds[0].fd = unix_socket;
     pollfds[0].events = POLLIN;
+    pollfds[0].revents = 0;
     int i = 1;
     for(const auto& child : childrenSocket) {
       pollfds[i].fd = child.second;
-      pollfds[i].events = POLLIN;
+      pollfds[i].events = 0;
+      pollfds[i].revents = 0;
       pollpids[i] = child.first;
       ++i;
     }
 
-    int res = poll(pollfds.data(), pollfds.size(), -1);
+    // Can't use ppoll (not POSIX, not on mac) to avoid race conditions, use a timeout
+    int res = poll(pollfds.data(), pollfds.size(), 10000);
+    if(res == 0)
+      continue;
     if(res == -1) {
       if(errno == EINTR)
         continue;
       cpperror("Error polling file descriptors");
     }
 
-    if(pollfds[0].revents | POLLIN) {
+    if(pollfds[0].revents & POLLIN) {
       // struct sockaddr_un addr;
       // socklen_t          addrlen;
       // std::cerr << "Unix socket pollin " << unix_socket << ' ' << pollfds[0].fd << std::endl;
       // system("ls -l /proc/self/fd");
-      int                fd = accept(pollfds[0].fd, nullptr, nullptr);
+      int fd = accept(pollfds[0].fd, nullptr, nullptr);
       if(fd == -1) {
         if(errno == EINTR)
           continue;
@@ -231,7 +251,8 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
       case 0:
         deferUnlink::parent = false;
         signals.reset();
-        close(unix_socket);
+        for(const auto poll : pollfds)
+          close(poll.fd);
         return handleChild(fd, argc, argv);
         break;
 
@@ -242,7 +263,7 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
     }
 
     for(size_t i = 1; i < pollfds.size(); ++i) {
-      if(pollfds[i].revents | POLLHUP) { // Client closed it's socket. Forget about it
+      if(pollfds[i].revents & POLLHUP) { // Client closed it's socket. Forget about it
         close(pollfds[i].fd);
         kill(pollpids[i], SIGTERM);
         childrenSocket[pollpids[i]] = -1;
@@ -256,8 +277,14 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
   return 0;
 }
 
-// In child, redirect outputs, update argc and argv, then continue processing.
-// In case of error, exit(1). Parent will send error to client.
+//
+// Server side, Child process.
+// 
+// Receive arguments and file descriptor.
+// After resetting the environment, return with -1 to keep on processing
+// with the quantification
+///
+
 constexpr int numFds = 4;
 static constexpr size_t size = 1024 * 1024; // Maximum argv size
 static std::vector<char> rawArgv;
@@ -315,8 +342,9 @@ int handleChild(int fd, int& argc, argvtype& argv) {
   }
 
   // First copy the existing argv[0]. Then add a missing fake '-i /' (5 characters).
-  // Then copy the arguments sent over by the client. Add 2 '\0' to make sure it is
-  // there is an extra null character after the end of the last string.
+  // Then copy the arguments sent over by the client. Add 2 '\0' to make sure
+  // there is an extra null character after the end of the last string (as there is
+  // in the original argv).
   //
   // XXX: This type of arithmetic is error prone!
   size_t arg0Len = strlen(argv[0]);
@@ -352,6 +380,14 @@ int handleChild(int fd, int& argc, argvtype& argv) {
 
   return -1;
 }
+
+//
+// Client side
+//
+// Pack the command line argument and my file descriptor to send to the
+// server (child process) via the UNIX socket. Then wait to receive status
+// of quantification by reading the UNIX socket.
+//
 
 // Send command line arguments and stdint, stdout, stderr and current directory
 void sendArguments(int unixSocket, const std::vector<std::string>& opts) {
@@ -446,6 +482,9 @@ int contactServer(const std::string& socketPath, const std::vector<std::string>&
       if(errno == EINTR)
         continue;
       cpperror("Failed to get return status from server");
+    }
+    if(received == 0) {
+      cpperror("Premature close from server");
     }
     break;
   }
