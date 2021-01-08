@@ -64,11 +64,12 @@
 
 // salmon includes
 #include "FastxParser.hpp"
+#include "ProgramOptionsGenerator.hpp"
 #include "SalmonConfig.hpp"
 #include "SalmonDefaults.hpp"
 #include "SalmonOpts.hpp"
+#include "SalmonServer.hpp"
 #include "SalmonUtils.hpp"
-#include "ProgramOptionsGenerator.hpp"
 
 using paired_parser_qual = fastx_parser::FastxParser<fastx_parser::ReadQualPair>;
 using single_parser = fastx_parser::FastxParser<fastx_parser::ReadSeq>;
@@ -960,6 +961,10 @@ int salmonBarcoding(int argc, const char* argv[]) {
   bool optChain{false};
   int32_t numBiasSamples{0};
   std::unique_ptr<SalmonIndex> salmonIndex; // For early loading
+
+  int serverDone = salmonServer(argc, argv, salmonIndex);
+  if (serverDone != -1)
+    return serverDone;
 
   double coverageThresh;
   //vector<string> unmatedReadFiles;
