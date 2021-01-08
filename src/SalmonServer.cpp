@@ -102,7 +102,7 @@ int serveIndex(const std::string& socketPath,
   auto consoleSink =
       std::make_shared<spdlog::sinks::stderr_sink_mt>();
   //  consoleSink->set_color(spdlog::level::warn, consoleSink->magenta);
-  auto consoleLog = spdlog::create("stderrLog", {consoleSink});
+  auto consoleLog = spdlog::create("servertderrLog", {consoleSink});
   salmonIndex = checkLoadIndex(indexDirectory, consoleLog);
 
   // This only returns in a child process to continue execution of Salmon
@@ -179,6 +179,7 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
   DefineSignals signals;
   signals.setup();
 
+  std::cerr << "Server waiting for requests" << std::endl;
   if(listen(unix_socket, 5) == -1)
     cpperror("Error listening on unix socket");
 
@@ -209,9 +210,11 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
     }
 
     if(pollfds[0].revents | POLLIN) {
-      struct sockaddr_un addr;
-      socklen_t          addrlen;
-      int                fd = accept(unix_socket, (struct sockaddr*)&addr, &addrlen);
+      // struct sockaddr_un addr;
+      // socklen_t          addrlen;
+      // std::cerr << "Unix socket pollin " << unix_socket << ' ' << pollfds[0].fd << std::endl;
+      // system("ls -l /proc/self/fd");
+      int                fd = accept(pollfds[0].fd, nullptr, nullptr);
       if(fd == -1) {
         if(errno == EINTR)
           continue;
@@ -228,6 +231,7 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
       case 0:
         deferUnlink::parent = false;
         signals.reset();
+        close(unix_socket);
         return handleChild(fd, argc, argv);
         break;
 
@@ -246,6 +250,7 @@ int serverMainLoop(int& argc, argvtype& argv, int unix_socket) {
     }
   }
 
+  close(unix_socket);
   std::cerr << "Waiting for remaining children" << std::endl;
   handleDoneChildren(childrenSocket);
   return 0;
@@ -270,7 +275,8 @@ int handleChild(int fd, int& argc, argvtype& argv) {
     char           buf[CMSG_SPACE(sizeof(fds))];
     struct cmsghdr align;
   } u;
-  struct msghdr msg = { 0 };
+  struct msghdr msg;
+  memset(&msg, '\0', sizeof(msg));
   msg.msg_iov = &io;
   msg.msg_iovlen = 1;
   msg.msg_control = u.buf;
@@ -308,10 +314,23 @@ int handleChild(int fd, int& argc, argvtype& argv) {
     close(fds[i]);
   }
 
-  // Receive arguments
-  rawArgv.resize(argvLen + 2, '\0'); // +1 to make sure that there is 2 '\0' at the end
+  // First copy the existing argv[0]. Then add a missing fake '-i /' (5 characters).
+  // Then copy the arguments sent over by the client. Add 2 '\0' to make sure it is
+  // there is an extra null character after the end of the last string.
+  //
+  // XXX: This type of arithmetic is error prone!
+  size_t arg0Len = strlen(argv[0]);
+  rawArgv.resize(argvLen + arg0Len + 5 + 2, '\0');
+  char* cur = rawArgv.data();
+  strcpy(cur, argv[0]);
+  cur += arg0Len + 1;
+  *cur++ = '-';
+  *cur++ = 'i';
+  ++cur;
+  *cur++ = '/';
+  ++cur;
   while(offset < argvLen) {
-    ssize_t received = recv(fd, rawArgv.data() + offset, argvLen - offset, 0);
+    ssize_t received = recv(fd, cur, argvLen - offset, 0);
     if(received == -1) {
       if(errno == EINTR)
         continue;
@@ -320,10 +339,11 @@ int handleChild(int fd, int& argc, argvtype& argv) {
     if(received == 0)
       throw std::runtime_error("Premature closure of client socket");
     offset += received;
+    cur += received;
   }
 
-  const char* cur = rawArgv.data();
-  while(cur < rawArgv.data() + argvLen) {
+  cur = rawArgv.data();
+  while(cur < rawArgv.data() + argvLen + arg0Len + 5) {
     childArgv.push_back(cur);
     cur += strlen(cur) + 1;
   }
@@ -366,7 +386,8 @@ void sendArguments(int unixSocket, const std::vector<std::string>& opts) {
     char           buf[CMSG_SPACE(sizeof(fds))];
     struct cmsghdr align;
   } u;
-  struct msghdr    msg  = {0};
+  struct msghdr    msg;
+  memset(&msg, '\0', sizeof(msg));
   msg.msg_iov           = &io;
   msg.msg_iovlen        = 1;
   msg.msg_control       = u.buf;
@@ -391,7 +412,7 @@ void sendArguments(int unixSocket, const std::vector<std::string>& opts) {
   size_t offset = 0;
   while (offset < argvLen) {
     ssize_t sent =
-        send(unixSocket, rawArgv.data() + offset, argvLen - offset, 0);
+        send(unixSocket, rawArgv.data() + offset, rawArgv.size() - offset, 0);
     if (sent == -1) {
       if (errno == EINTR)
         continue;
