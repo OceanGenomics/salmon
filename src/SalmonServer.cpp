@@ -25,7 +25,7 @@
 namespace po = boost::program_options;
 
 // Same error status as salmoneServer
-static int serveIndex(const std::string& socketPath, const std::string& indexPath,
+static int serveIndex(const std::string& socketPath, const std::string& indexPath, int notifyFD,
                 int& argc, argvtype& argv,
                 std::unique_ptr<SalmonIndex>& salmonIndex);
 static int serverMainLoop(int&argc, argvtype& argv, int unix_socket);
@@ -37,6 +37,7 @@ int salmonServer(int& argc, argvtype& argv, std::unique_ptr<SalmonIndex>& salmon
   servero.add_options()
     ("index,i", po::value<string>(), "salmon index")
     ("server", po::value<string>(), "server socket path")
+    ("server-notify", po::value<int>()->default_value(-1), "file descriptor to send ready notification")
     ("args", po::value<std::vector<std::string>>(), "Args");
   po::positional_options_description pd;
   pd.add("args", -1);
@@ -51,7 +52,7 @@ int salmonServer(int& argc, argvtype& argv, std::unique_ptr<SalmonIndex>& salmon
 
   try {
     if(vm.count("index"))
-      return serveIndex(vm["server"].as<string>(), vm["index"].as<string>(), argc, argv, salmonIndex);
+      return serveIndex(vm["server"].as<string>(), vm["index"].as<string>(), vm["server-notify"].as<int>(), argc, argv, salmonIndex);
     else {
       auto opts = po::collect_unrecognized(parsed.options, po::include_positional);
       return contactServer(vm["server"].as<string>(), opts);
@@ -137,6 +138,7 @@ bool deferUnlink::parent = true;
 
 int serveIndex(const std::string& socketPath,
                const std::string& indexPath,
+               int notifyFd,
                int& argc, argvtype& argv,
                std::unique_ptr<SalmonIndex>& salmonIndex) {
   // Create unix socket and bind it
@@ -161,6 +163,12 @@ int serveIndex(const std::string& socketPath,
   //  consoleSink->set_color(spdlog::level::warn, consoleSink->magenta);
   auto consoleLog = spdlog::create("servertderrLog", {consoleSink});
   salmonIndex = checkLoadIndex(indexDirectory, consoleLog);
+
+  // Ready to serve
+  if(notifyFd != -1) {
+    sendBuffer(notifyFd, "ready", 6);
+    close(notifyFd);
+  }
 
   // This only returns in a child process to continue execution of Salmon
   return serverMainLoop(argc, argv, unix_socket);
