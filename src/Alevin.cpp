@@ -68,7 +68,6 @@
 #include "SalmonConfig.hpp"
 #include "SalmonDefaults.hpp"
 #include "SalmonOpts.hpp"
-#include "SalmonServer.hpp"
 #include "SalmonUtils.hpp"
 
 using paired_parser_qual = fastx_parser::FastxParser<fastx_parser::ReadQualPair>;
@@ -953,18 +952,13 @@ void initiatePipeline(AlevinOpts<ProtocolT>& aopt,
   }
 }
 
-int salmonBarcoding(int argc, const char* argv[]) {
+int salmonBarcoding(int argc, const char* argv[], std::unique_ptr<SalmonIndex>& salmonIndex) {
   namespace bfs = boost::filesystem;
   namespace po = boost::program_options;
 
   std::vector<std::string> barcodeFiles, readFiles, unmateFiles;
   bool optChain{false};
   int32_t numBiasSamples{0};
-  std::unique_ptr<SalmonIndex> salmonIndex; // For early loading
-
-  int serverDone = salmonServer(argc, argv, salmonIndex);
-  if (serverDone != -1)
-    return serverDone;
 
   double coverageThresh;
   //vector<string> unmatedReadFiles;

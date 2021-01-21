@@ -94,7 +94,6 @@
 #include "SalmonUtils.hpp"
 #include "Transcript.hpp"
 #include "SalmonMappingUtils.hpp"
-#include "SalmonServer.hpp"
 
 #include "AlignmentGroup.hpp"
 #include "BiasParams.hpp"
@@ -2387,7 +2386,7 @@ void quantifyLibrary(ReadExperimentT& experiment,
   jointLog->info("finished quantifyLibrary()");
 }
 
-int salmonQuantify(int argc, const char* argv[]) {
+int salmonQuantify(int argc, const char* argv[], std::unique_ptr<SalmonIndex>& salmonIndex) {
   using std::cerr;
   using std::vector;
   using std::string;
@@ -2395,13 +2394,6 @@ int salmonQuantify(int argc, const char* argv[]) {
   namespace po = boost::program_options;
 
   int32_t numBiasSamples{0};
-  std::unique_ptr<SalmonIndex> salmonIndex; // For early loading
-
-  // If passed --server: Read index and wait for requests if passed --index,-i,
-  // or contact a server if --index,-i is missing. Otherwise, do nothing
-  int serverDone = salmonServer(argc, argv, salmonIndex);
-  if(serverDone != -1)
-    return serverDone;
 
   SalmonOpts sopt;
 
