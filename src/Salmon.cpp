@@ -151,14 +151,10 @@ int salmonIndex(int argc, const char* argv[], std::unique_ptr<SalmonIndex>& inde
 int salmonQuantify(int argc, const char* argv[], std::unique_ptr<SalmonIndex>& index);
 int salmonAlignmentQuantify(int argc, const char* argv[], std::unique_ptr<SalmonIndex>& index);
 int salmonAlignmentDualMode(int argc, const char* argv[], std::unique_ptr<SalmonIndex>& index);
-int salmonServer(int argc, const char* argv[], std::unique_ptr<SalmonIndex>& index); // Place holder
 // TODO : PF_INTEGRATION
 int salmonBarcoding(int argc, const char* argv[], std::unique_ptr<SalmonIndex>& index);
 int salmonQuantMerge(int argc, const char* argv[],
                      std::unique_ptr<SalmonIndex>& index);
-
-int salmonServerServer(int& argc, const char** &argv, std::unique_ptr<SalmonIndex>& index); // Actual server subcmd handling
-int salmonServerClient(const std::string& subcommand, int argc, const char* argv[]);
 
 bool verbose = false;
 
@@ -249,8 +245,7 @@ int main(int argc, const char* argv[]) {
          {"quantmerge", salmonQuantMerge},
          // TODO : PF_INTEGRATION
          {"alevin", salmonBarcoding},
-         {"swim", salmonSwim},
-         {"server", salmonServer}});
+         {"swim", salmonSwim}});
 
     /*
     //string cmd = vm["command"].as<string>();
@@ -270,74 +265,11 @@ int main(int argc, const char* argv[]) {
     }
     const char** nargv = argv2.get();
 
-    { // Check if we are called with --server. If not, it returns -1 and
-      // processing continues normally. If yes, then a server is contacted to
-      // perform computation and an actual error code is returned.
-      int code = salmonServerClient(cmd, nargc, nargv);
-      if (code != -1)
-        return code;
-    }
-
-    // auto cmdMain = cmds.find(cmd);
-    // if (cmdMain == cmds.end()) {
-    //   // help(subCommandArgc, argv2);
-    //   return help(opts);
-    // } else {
-    //   // If the command is quant; determine whether
-    //   // we're quantifying with raw sequences or alignments
-    //   if (cmdMain->first == "quant") {
-
-    //     if (subCommandArgc < 2) {
-    //       return dualModeMessage();
-    //     }
-    //     // detect mode-specific help request
-    //     if (strncmp(argv2[1], "--help-alignment", 16) == 0) {
-    //       std::vector<char> helpStr{'-', '-', 'h', 'e', 'l', 'p', '\0'};
-    //       const char* helpArgv[] = {argv[0], &helpStr[0]};
-    //       return salmonAlignmentQuantify(2, helpArgv);
-    //     } else if (strncmp(argv2[1], "--help-reads", 12) == 0) {
-    //       std::vector<char> helpStr{'-', '-', 'h', 'e', 'l', 'p', '\0'};
-    //       const char* helpArgv[] = {argv[0], &helpStr[0]};
-    //       return salmonQuantify(2, helpArgv);
-    //     }
-
-    //     // detect general help request
-    //     if (strncmp(argv2[1], "--help", 6) == 0 or
-    //         strncmp(argv2[1], "-h", 2) == 0) {
-    //       return dualModeMessage();
-    //     }
-
-    //     // otherwise, detect and dispatch the correct mode
-    //     bool useSalmonAlign{false};
-    //     for (int32_t i = 0; i < subCommandArgc; ++i) {
-    //       if (strncmp(argv2[i], "-a", 2) == 0 or
-    //           strncmp(argv2[i], "-e", 2) == 0 or
-    //           strncmp(argv2[i], "--alignments", 12) == 0 or
-    //           strncmp(argv2[i], "--eqclasses", 11) == 0 or
-    //           strcmp(argv2[i], "--ont") == 0) {
-    //         useSalmonAlign = true;
-    //         break;
-    //       }
-    bool inServer = false;
     while(true) {
       auto cmdMain = cmds.find(cmd);
       if (cmdMain == cmds.end()) {
         // help(subCommandArgc, argv2);
         return help(opts);
-      }
-      if(cmdMain->first == "server") {
-        if(inServer) {
-          std::cerr << "Can't run server subcommand from the client";
-        }
-        // server is special: it modifies its arguments and then loops around to
-        // process actual command sent by the client. (salmonServer doesn't really exists)
-        int code = salmonServerServer(nargc, nargv, preloadedIndex);
-        if(code ==- 1) {
-          cmd = nargv[1];
-          inServer = true;
-          continue;
-        }
-        return code;
       }
       return cmdMain->second(nargc, nargv, preloadedIndex);
     }
