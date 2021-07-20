@@ -22,14 +22,16 @@ if [ -d ${INSTALL_DIR}/src/pufferfish ] ; then
     rm -fr ${INSTALL_DIR}/src/pufferfish
 fi
 
-SVER=salmon-v1.5.1
+SVER=soft-clip
+#SVER=salmon-v1.5.1
 #SVER=develop
 #SVER=sketch-mode
 
-EXPECTED_SHA256=468e0c23a32d81524f7acadc8326efb155628970c15fd6cb843d26a61478bfde
-
+#EXPECTED_SHA256=468e0c23a32d81524f7acadc8326efb155628970c15fd6cb843d26a61478bfde
+EXPECTED_SHA256=3b15d4b121222b567cd8b6d7555fc1ef014c55b7ccff667842f7f106569159c9
 mkdir -p ${EXTERNAL_DIR}
-curl -k -L https://github.com/COMBINE-lab/pufferfish/archive/${SVER}.zip -o ${EXTERNAL_DIR}/pufferfish.zip
+#curl -k -L https://github.com/COMBINE-lab/pufferfish/archive/${SVER}.zip -o ${EXTERNAL_DIR}/pufferfish.zip
+curl -k -L https://github.com/OceanGenomics/pufferfish/archive/${SVER}.zip -o ${EXTERNAL_DIR}/pufferfish.zip
 
 hashcheck=""
 if exists sha256sum; then

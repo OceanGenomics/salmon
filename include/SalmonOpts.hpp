@@ -266,6 +266,7 @@ struct SalmonOpts {
   bool disableChainingHeuristic;
   bool disableAlignmentCache;
   double minScoreFraction;
+  double maxSoftclipFraction;
   double scoreExp;
   int16_t matchScore;
   int16_t mismatchPenalty;
@@ -277,6 +278,7 @@ struct SalmonOpts {
   bool mimicBT2;
   bool softclip;
   bool softclipOverhangs;
+  bool computeCIGAR;
   bool fullLengthAlignment;
   bool allowDovetail;
   bool recoverOrphans;
